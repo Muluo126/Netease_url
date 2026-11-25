@@ -15,6 +15,10 @@ from pathlib import Path
 from music_downloader import MusicDownloader, QualityLevel
 
 
+# 特殊音效是不同的处理模式，失败后回退到基础音质链。
+BASE_QUALITIES = ('hires', 'lossless', 'exhigh', 'standard')
+
+
 class BatchBusyError(Exception):
     """当前批量任务已达到并发上限。"""
 
@@ -76,7 +80,8 @@ class BatchDownloadManager:
             job = {
                 'id': job_id, 'state': 'queued', 'quality': quality,
                 'total': len(normalized), 'completed': 0, 'succeeded': 0, 'failed': 0,
-                'current_id': None, 'failures': [], 'message': '等待下载',
+                'current_id': None, 'current_quality': None, 'failures': [],
+                'fallback_count': 0, 'fallbacks': [], 'message': '等待下载',
                 'filename': f'{safe_name} [{quality}].zip',
                 '_directory': directory, '_archive': directory / 'music.zip',
             }
@@ -107,51 +112,87 @@ class BatchDownloadManager:
         with self.lock:
             self.jobs[job_id].update(values)
 
+    @staticmethod
+    def _quality_candidates(quality):
+        if quality in BASE_QUALITIES:
+            return BASE_QUALITIES[BASE_QUALITIES.index(quality):]
+        return (quality,) + BASE_QUALITIES
+
+    def _download_with_fallback(self, job_id, song_id, song_dir, attempts):
+        requested_quality = self.jobs[job_id]['quality']
+        song_dir.mkdir()
+        for quality in self._quality_candidates(requested_quality):
+            message = '正在降低音质重试' if attempts else '正在下载'
+            self._update(job_id, current_quality=quality, message=message)
+            try:
+                # 每次尝试使用独立目录，失败残留文件不会被下一音质误当作缓存。
+                downloader = self.downloader_factory(download_dir=str(song_dir / quality))
+                result = downloader.download_music_file(song_id, quality)
+                if not result.success or not result.file_path:
+                    raise RuntimeError(result.error_message or '下载失败')
+                file_path = Path(result.file_path)
+                if not file_path.is_file() or file_path.stat().st_size == 0:
+                    raise RuntimeError('下载文件为空或不存在')
+            except Exception as exc:
+                attempts.append({'quality': quality, 'success': False, 'message': str(exc)})
+                self.logger.warning('批量任务 %s 歌曲 %s 音质 %s 下载失败: %s',
+                                    job_id, song_id, quality, exc)
+                continue
+            actual_quality = result.music_info.quality if result.music_info else quality
+            attempts.append({'quality': quality, 'success': True, 'actual_quality': actual_quality})
+            return file_path, actual_quality
+        raise RuntimeError(attempts[-1]['message'])
+
     def _run(self, job_id, ids):
         job = self.jobs[job_id]
         directory = job['_directory']
         results = []
         succeeded = 0
         failures = []
+        fallbacks = []
         try:
             self._update(job_id, state='running', message='正在下载')
             # 音频已压缩，ZIP_STORED 避免再次压缩耗费 CPU；始终使用磁盘文件。
             with zipfile.ZipFile(job['_archive'], 'w', compression=zipfile.ZIP_STORED) as archive:
                 for index, song_id in enumerate(ids, 1):
                     song_dir = directory / str(song_id)
+                    attempts = []
                     self._update(job_id, current_id=song_id)
                     try:
-                        # 每首独立目录，避免同名歌曲、不同音质和其他任务的缓存混用。
-                        downloader = self.downloader_factory(download_dir=str(song_dir))
-                        result = downloader.download_music_file(song_id, job['quality'])
-                        if not result.success or not result.file_path:
-                            raise RuntimeError(result.error_message or '下载失败')
-                        file_path = Path(result.file_path)
-                        if not file_path.is_file() or file_path.stat().st_size == 0:
-                            raise RuntimeError('下载文件为空或不存在')
+                        file_path, actual_quality = self._download_with_fallback(
+                            job_id, song_id, song_dir, attempts)
                         filename = f'{index:03d} - {song_id} - {file_path.name}'
                         archive.write(file_path, arcname=filename)
-                        results.append({'id': song_id, 'success': True, 'filename': filename})
+                        results.append({'id': song_id, 'success': True, 'filename': filename,
+                                        'requested_quality': job['quality'], 'quality': actual_quality,
+                                        'attempts': attempts})
+                        if actual_quality != job['quality']:
+                            fallbacks.append({'id': song_id, 'requested_quality': job['quality'],
+                                              'quality': actual_quality})
                         succeeded += 1
                     except Exception as exc:
                         self.logger.warning('批量任务 %s 歌曲 %s 下载失败: %s', job_id, song_id, exc)
-                        failure = {'id': song_id, 'message': str(exc)}
+                        failure = {'id': song_id, 'message': str(exc), 'attempts': attempts}
                         failures.append(failure)
-                        results.append({'id': song_id, 'success': False, 'message': str(exc)})
+                        results.append({'id': song_id, 'success': False, 'message': str(exc),
+                                        'requested_quality': job['quality'], 'attempts': attempts})
                     finally:
                         shutil.rmtree(song_dir, ignore_errors=True)
                     self._update(job_id, completed=index, succeeded=succeeded,
-                                 failed=len(failures), failures=list(failures))
+                                 failed=len(failures), failures=list(failures),
+                                 fallback_count=len(fallbacks), fallbacks=list(fallbacks))
                 manifest = {'quality': job['quality'], 'total': len(ids),
-                            'succeeded': succeeded, 'failed': len(failures), 'songs': results}
+                            'succeeded': succeeded, 'failed': len(failures),
+                            'fallback_count': len(fallbacks), 'songs': results}
                 archive.writestr('下载清单.json', json.dumps(manifest, ensure_ascii=False, indent=2))
             if not succeeded:
                 job['_archive'].unlink(missing_ok=True)
-            self._update(job_id, state='completed' if succeeded else 'failed', current_id=None,
+            self._update(job_id, state='completed' if succeeded else 'failed',
+                         current_id=None, current_quality=None,
                          message='打包完成' if succeeded else '所有歌曲下载失败，请检查 Cookie、版权或音质',
                          _finished_at=time.time())
         except Exception:
             self.logger.exception('批量任务 %s 失败', job_id)
             job['_archive'].unlink(missing_ok=True)
-            self._update(job_id, state='failed', current_id=None,
+            self._update(job_id, state='failed', current_id=None, current_quality=None,
                          message='批量下载失败，请检查服务器日志和可用磁盘空间', _finished_at=time.time())

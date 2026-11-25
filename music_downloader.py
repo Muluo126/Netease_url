@@ -244,7 +244,7 @@ class MusicDownloader:
                 download_url=download_url,
                 file_type=song_data.get("type", "mp3").lower(),
                 file_size=song_data.get("size", 0),
-                quality=quality,
+                quality=song_data.get("level") or quality,
                 lyric=lyric,
                 tlyric=tlyric,
             )

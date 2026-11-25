@@ -3,6 +3,8 @@ $(function () {
     'use strict';
 
     const lists = {search: '#search-list', playlist: '#playlist-tracks', album: '#album-tracks'};
+    const qualityNames = {standard: '标准', exhigh: '极高', lossless: '无损', hires: 'Hi-Res',
+        jyeffect: '高清环绕声', sky: '沉浸环绕声', jymaster: '超清母带', vivid: '臻音全景声', dolby: '杜比全景声'};
     let activeJob = null;
     let polling = false;
     let pollFailures = 0;
@@ -20,6 +22,7 @@ $(function () {
             <a id="batch-file" class="btn btn-success mt-0 d-none" download>下载 ZIP（1 小时内有效）</a>
             <button id="batch-resume" class="btn btn-outline-primary d-none" type="button">继续查询进度</button>
             <details id="batch-errors" class="mt-3 d-none"><summary>下载失败的歌曲</summary><ul></ul></details>
+            <details id="batch-fallbacks" class="mt-3 d-none"><summary>已降低音质下载的歌曲</summary><ul></ul></details>
         </div>`);
 
     Object.entries(lists).forEach(([scope, selector]) => {
@@ -111,9 +114,13 @@ $(function () {
             const job = payload.data;
             const percent = Math.round(job.completed / job.total * 100);
             $('#batch-progress-bar').css('width', `${percent}%`).attr('aria-valuenow', percent).text(`${percent}%`);
-            $('#batch-status').text(`${job.message}：${job.completed}/${job.total}，成功 ${job.succeeded} 首，失败 ${job.failed} 首`);
+            const currentQuality = job.current_quality ? `（${qualityNames[job.current_quality] || job.current_quality}）` : '';
+            $('#batch-status').text(`${job.message}${currentQuality}：${job.completed}/${job.total}，成功 ${job.succeeded} 首，失败 ${job.failed} 首，降级成功 ${job.fallback_count || 0} 首`);
             const errors = $('#batch-errors').toggleClass('d-none', !job.failures.length).find('ul').empty();
             job.failures.forEach(failure => $('<li>').text(`歌曲 ${failure.id}：${failure.message}`).appendTo(errors));
+            const fallbacks = job.fallbacks || [];
+            const fallbackList = $('#batch-fallbacks').toggleClass('d-none', !fallbacks.length).find('ul').empty();
+            fallbacks.forEach(song => $('<li>').text(`歌曲 ${song.id}：${qualityNames[song.requested_quality] || song.requested_quality} → ${qualityNames[song.quality] || song.quality}`).appendTo(fallbackList));
             if (job.state === 'completed') {
                 const link = $('#batch-file').attr('href', `/download/batch/${job.id}/file`)
                     .attr('download', job.filename).removeClass('d-none');
@@ -156,7 +163,7 @@ $(function () {
         activeJob = 'creating';
         updateAll();
         panel.removeClass('d-none');
-        $('#batch-file, #batch-resume, #batch-errors').addClass('d-none');
+        $('#batch-file, #batch-resume, #batch-errors, #batch-fallbacks').addClass('d-none');
         $('#batch-progress-bar').css('width', '0%').attr('aria-valuenow', 0).text('0%');
         $('#batch-status').text(`正在创建任务，共 ${ids.length} 首歌曲…`);
         let response;
