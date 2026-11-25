@@ -45,7 +45,7 @@ class BatchDownloadTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.manager = BatchDownloadManager(self.temp.name, downloader_factory=FakeDownloader)
+        self.manager = BatchDownloadManager(self.temp.name, retry_delay=0, downloader_factory=FakeDownloader)
 
     def test_zip_order_deduplication_and_partial_success(self):
         job = self.manager.create(['1', 2, '01', 3, 4, 5], 'hires', '../测试/歌单')
@@ -85,7 +85,7 @@ class BatchDownloadTests(unittest.TestCase):
                 result.music_info = SimpleNamespace(name=names[song_id], quality=quality)
                 return result
 
-        manager = BatchDownloadManager(self.temp.name, downloader_factory=NamedDownloader)
+        manager = BatchDownloadManager(self.temp.name, retry_delay=0, downloader_factory=NamedDownloader)
         job = manager.create([1, 3, 6, 7, 8], 'lossless')
         self.assertEqual(wait_for_job(manager, job['id'])['succeeded'], 5)
         path, _ = manager.get_archive(job['id'])
@@ -127,7 +127,7 @@ class BatchDownloadTests(unittest.TestCase):
                 release.wait(5)
                 return super().download_music_file(song_id, quality)
 
-        manager = BatchDownloadManager(self.temp.name, max_active_jobs=1, downloader_factory=BlockedDownloader)
+        manager = BatchDownloadManager(self.temp.name, retry_delay=0, max_active_jobs=1, downloader_factory=BlockedDownloader)
         job = manager.create([1])
         try:
             self.assertTrue(started.wait(2))
@@ -166,7 +166,7 @@ class BatchDownloadTests(unittest.TestCase):
         self.assertTrue(unrelated.exists())
 
 
-class QualityFallbackTests(unittest.TestCase):
+class QualityRetryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -176,10 +176,11 @@ class QualityFallbackTests(unittest.TestCase):
 
         class ScriptedDownloader(FakeDownloader):
             def download_music_file(self, song_id, quality):
+                number = sum(mid == song_id for mid, _ in test.calls) + 1
                 test.calls.append((song_id, quality))
                 path = self.directory / '歌曲.mp3'
-                test.assertFalse(path.exists(), '下一音质不得复用失败文件')
-                response = test.responses.get((song_id, quality), quality)
+                test.assertFalse(path.exists(), '重试不得复用失败文件')
+                response = test.responses.get((song_id, number), quality)
                 if isinstance(response, Exception):
                     path.write_bytes(b'incomplete')
                     raise response
@@ -193,7 +194,7 @@ class QualityFallbackTests(unittest.TestCase):
                 return DownloadResult(success=True, file_path=str(path),
                                       music_info=SimpleNamespace(quality=response))
 
-        self.manager = BatchDownloadManager(self.temp.name, downloader_factory=ScriptedDownloader)
+        self.manager = BatchDownloadManager(self.temp.name, retry_delay=0, downloader_factory=ScriptedDownloader)
 
     def manifest(self, job_id):
         path, _ = self.manager.get_archive(job_id)
@@ -205,72 +206,94 @@ class QualityFallbackTests(unittest.TestCase):
         self.assertEqual(list(path.parent.iterdir()), [path])
         return result
 
-    def test_lossless_timeout_falls_back_once_and_next_song_keeps_original_quality(self):
-        self.responses[(1, 'lossless')] = False
+    def test_timeout_retries_same_quality_and_stops_on_success(self):
+        self.responses[(1, 1)] = False
         job = self.manager.create([1, 3], 'lossless')
         final = wait_for_job(self.manager, job['id'])
-        self.assertEqual(self.calls, [(1, 'lossless'), (1, 'exhigh'), (3, 'lossless')])
-        self.assertEqual((final['succeeded'], final['failed'], final['fallback_count']), (2, 0, 1))
-        self.assertEqual(final['fallbacks'], [{'id': 1, 'requested_quality': 'lossless', 'quality': 'exhigh'}])
+        self.assertEqual(self.calls, [(1, 'lossless'), (1, 'lossless'), (3, 'lossless')])
+        self.assertEqual((final['succeeded'], final['failed'], final['retried_count'], final['retry_count']), (2, 0, 1, 1))
+        self.assertEqual(final['retries'], [{'id': 1, 'quality': 'lossless', 'attempts': 2}])
         manifest = self.manifest(job['id'])
-        self.assertEqual(manifest['fallback_count'], 1)
+        self.assertEqual(manifest['retried_count'], 1)
         song = manifest['songs'][0]
-        self.assertEqual((song['requested_quality'], song['quality']), ('lossless', 'exhigh'))
+        self.assertEqual((song['requested_quality'], song['quality']), ('lossless', 'lossless'))
         self.assertEqual([attempt['success'] for attempt in song['attempts']], [False, True])
+        self.assertEqual([attempt['attempt'] for attempt in song['attempts']], [1, 2])
 
-    def test_retries_exceptions_failed_results_and_empty_files_down_to_standard(self):
-        self.responses.update({(1, 'hires'): DownloadException('超时'),
-                               (1, 'lossless'): False, (1, 'exhigh'): 'empty'})
+    def test_success_on_third_attempt_preserves_hires(self):
+        self.responses.update({(1, 1): DownloadException('超时'), (1, 2): False})
         job = self.manager.create([1], 'hires')
         final = wait_for_job(self.manager, job['id'])
-        self.assertEqual(self.calls, [(1, quality) for quality in ('hires', 'lossless', 'exhigh', 'standard')])
-        self.assertEqual(final['state'], 'completed')
+        self.assertEqual(self.calls, [(1, 'hires')] * 3)
+        self.assertEqual((final['state'], final['retry_count']), ('completed', 2))
         song = self.manifest(job['id'])['songs'][0]
-        self.assertEqual(song['quality'], 'standard')
-        self.assertEqual(len(song['attempts']), 4)
+        self.assertEqual(song['quality'], 'hires')
+        self.assertEqual(len(song['attempts']), 3)
 
-    def test_all_qualities_fail_only_counts_song_once_then_continues(self):
-        for quality in ('lossless', 'exhigh', 'standard'):
-            self.responses[(1, quality)] = DownloadException('Read timed out')
+    def test_exceptions_failed_results_and_empty_files_exhaust_limit(self):
+        self.responses.update({(1, 1): DownloadException('超时'), (1, 2): False, (1, 3): 'empty'})
         job = self.manager.create([1, 3], 'lossless')
         final = wait_for_job(self.manager, job['id'])
-        self.assertEqual(self.calls, [(1, 'lossless'), (1, 'exhigh'), (1, 'standard'), (3, 'lossless')])
-        self.assertEqual((final['completed'], final['succeeded'], final['failed']), (2, 1, 1))
+        self.assertEqual(self.calls, [(1, 'lossless')] * 3 + [(3, 'lossless')])
+        self.assertEqual((final['completed'], final['succeeded'], final['failed'], final['retry_count']), (2, 1, 1, 2))
         self.assertEqual(len(final['failures'][0]['attempts']), 3)
-        self.assertEqual(self.manifest(job['id'])['songs'][0]['success'], False)
+        self.assertFalse(self.manifest(job['id'])['songs'][0]['success'])
 
-    def test_standard_is_attempted_only_once(self):
-        self.responses[(1, 'standard')] = False
-        job = self.manager.create([1], 'standard')
-        final = wait_for_job(self.manager, job['id'])
-        self.assertEqual(self.calls, [(1, 'standard')])
-        self.assertEqual(final['state'], 'failed')
-
-    def test_special_modes_fall_back_to_hires_without_trying_other_effects(self):
-        for mode in ('jyeffect', 'sky', 'jymaster', 'vivid', 'dolby'):
-            with self.subTest(mode=mode):
+    def test_every_supported_quality_is_retried_without_switching_quality(self):
+        for quality in ('standard', 'exhigh', 'lossless', 'hires', 'jyeffect', 'sky', 'jymaster', 'vivid', 'dolby'):
+            with self.subTest(quality=quality):
                 self.calls.clear()
-                self.responses[(1, mode)] = False
-                job = self.manager.create([1], mode)
+                self.responses[(1, 1)] = False
+                job = self.manager.create([1], quality)
                 final = wait_for_job(self.manager, job['id'])
-                self.assertEqual(self.calls, [(1, mode), (1, 'hires')])
-                self.assertEqual(final['fallback_count'], 1)
+                self.assertEqual(self.calls, [(1, quality)] * 2)
+                self.assertEqual(final['retried_count'], 1)
 
-    def test_provider_returned_quality_is_reported_without_extra_downloads(self):
-        self.responses[(1, 'lossless')] = 'standard'
+    def test_all_failed_attempts_do_not_offer_zip(self):
+        self.responses.update({(1, number): False for number in (1, 2, 3)})
+        job = self.manager.create([1], 'jymaster')
+        final = wait_for_job(self.manager, job['id'])
+        self.assertEqual(self.calls, [(1, 'jymaster')] * 3)
+        self.assertEqual((final['state'], final['failed']), ('failed', 1))
+        self.assertIsNone(self.manager.get_archive(job['id']))
+
+    def test_provider_returned_quality_is_recorded_without_requesting_lower_quality(self):
+        self.responses[(1, 1)] = 'standard'
         job = self.manager.create([1], 'lossless')
         final = wait_for_job(self.manager, job['id'])
         self.assertEqual(self.calls, [(1, 'lossless')])
-        self.assertEqual(final['fallbacks'][0]['quality'], 'standard')
+        self.assertEqual(final['retried_count'], 0)
         self.assertEqual(self.manifest(job['id'])['songs'][0]['quality'], 'standard')
+
+    def test_retry_limit_and_delays_can_be_configured(self):
+        from unittest.mock import call
+        self.manager.max_attempts = 4
+        self.manager.retry_delay = 2
+        self.responses.update({(1, number): False for number in (1, 2, 3)})
+        with patch('batch_downloads.threading.Thread.start'):
+            job = self.manager.create([1], 'hires')
+        with patch('batch_downloads.time.sleep') as sleep:
+            self.manager._run(job['id'], [1])
+        self.assertEqual(sleep.call_args_list, [call(2), call(4), call(6)])
+        self.assertEqual(self.calls, [(1, 'hires')] * 4)
+        self.assertEqual(self.manager.get(job['id'])['state'], 'completed')
+
+    def test_invalid_retry_configuration_is_rejected(self):
+        for value in (0, -1, True, 1.5):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                BatchDownloadManager(self.temp.name, max_attempts=value)
+        with self.assertRaises(ValueError):
+            BatchDownloadManager(self.temp.name, retry_delay=-1)
 
     def test_real_downloader_re_resolves_url_after_mid_stream_timeout(self):
         import requests
         from unittest.mock import Mock, call
+        resolutions = []
 
         def info(song_id, quality):
+            resolutions.append(quality)
             return MusicInfo(song_id, '歌曲', '歌手', '专辑', '', 1, 1,
-                             f'https://example.invalid/{quality}', 'mp3', 0, quality)
+                             f'https://example.invalid/{quality}/{len(resolutions)}', 'mp3', 0, quality)
 
         def timeout_chunks(**kwargs):
             yield b'incomplete'
@@ -279,15 +302,15 @@ class QualityFallbackTests(unittest.TestCase):
         failed_response, success_response = Mock(), Mock()
         failed_response.iter_content.side_effect = timeout_chunks
         success_response.iter_content.return_value = [b'complete audio']
-        manager = BatchDownloadManager(self.temp.name)
+        manager = BatchDownloadManager(self.temp.name, retry_delay=0)
         with patch.object(MusicDownloader, 'get_music_info', side_effect=info) as resolve, \
              patch.object(MusicDownloader, '_write_metadata_with_ffmpeg', return_value=False), \
              patch('music_downloader.requests.get', side_effect=[failed_response, success_response]) as get:
             job = manager.create([1], 'lossless')
             final = wait_for_job(manager, job['id'])
-        self.assertEqual(resolve.call_args_list, [call(1, 'lossless'), call(1, 'exhigh')])
+        self.assertEqual(resolve.call_args_list, [call(1, 'lossless'), call(1, 'lossless')])
         self.assertEqual([args.args[0] for args in get.call_args_list],
-                         ['https://example.invalid/lossless', 'https://example.invalid/exhigh'])
+                         ['https://example.invalid/lossless/1', 'https://example.invalid/lossless/2'])
         self.assertEqual((final['succeeded'], final['failed']), (1, 0))
         path, _ = manager.get_archive(job['id'])
         with zipfile.ZipFile(path) as archive:
@@ -305,24 +328,27 @@ class QualityFallbackTests(unittest.TestCase):
 
     def test_status_shows_retry_without_marking_song_failed(self):
         release, started = threading.Event(), threading.Event()
+        calls = []
 
-        class BlockedFallback(FakeDownloader):
+        class BlockedRetry(FakeDownloader):
             def download_music_file(self, song_id, quality):
-                if quality == 'lossless':
+                calls.append(quality)
+                if len(calls) == 1:
                     return DownloadResult(success=False, error_message='Read timed out')
                 started.set()
                 release.wait(5)
                 return super().download_music_file(song_id, quality)
 
-        manager = BatchDownloadManager(self.temp.name, downloader_factory=BlockedFallback)
+        manager = BatchDownloadManager(self.temp.name, retry_delay=0, downloader_factory=BlockedRetry)
         job = manager.create([1], 'lossless')
         try:
             self.assertTrue(started.wait(2))
             current = manager.get(job['id'])
             self.assertEqual(current['state'], 'running')
-            self.assertEqual(current['current_quality'], 'exhigh')
+            self.assertEqual(current['current_quality'], 'lossless')
             self.assertEqual((current['completed'], current['failed']), (0, 0))
-            self.assertEqual(current['message'], '正在降低音质重试')
+            self.assertEqual((current['current_attempt'], current['max_attempts']), (2, 3))
+            self.assertEqual(current['message'], '正在重试下载')
         finally:
             release.set()
             wait_for_job(manager, job['id'])
@@ -338,7 +364,7 @@ class BatchRouteTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.manager = BatchDownloadManager(self.temp.name, downloader_factory=FakeDownloader)
+        self.manager = BatchDownloadManager(self.temp.name, retry_delay=0, downloader_factory=FakeDownloader)
         self.replace_manager = patch.object(self.main, 'batch_downloads', self.manager)
         self.replace_manager.start()
         self.addCleanup(self.replace_manager.stop)

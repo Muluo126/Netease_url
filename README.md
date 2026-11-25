@@ -150,11 +150,11 @@ docker run -d -p 5000:5000 netease-music-api
 4. 页面显示后台处理进度，完成后自动请求保存 ZIP，也可点击「下载 ZIP」重新下载。
 
 ZIP 包含成功下载的音频和 `下载清单.json`，记录每首歌曲的成功结果或失败原因。
-单首失败会自动降一级音质重试：`hires → lossless → exhigh → standard`，成功后立即停止重试。
-环绕声、母带、杜比等特殊模式失败时先回退到 `hires`，再沿基础音质链重试。
-读取超时也会触发降级，每次重新解析下载链接，并隔离失败残留文件。
-所有音质都失败后才计为失败并继续下一首；每首歌都会从用户选择的音质开始。
-页面显示降级成功数量和音质变化；清单记录请求音质、最终音质及每次尝试的结果。
+单首失败会保持用户选择的音质重试，默认每首最多尝试 3 次（首次下载 + 2 次重试），成功后立即停止。
+读取超时也会触发重试，每次重新解析下载链接，并使用独立目录隔离失败残留文件；重试前依次等待 1 秒、2 秒。
+达到尝试上限后才计为失败并继续下一首；标准音质及特殊音效模式使用相同的重试策略。
+页面显示当前尝试次数、重试成功数量和明细；清单记录请求音质、接口实际返回音质及每次尝试的结果。
+`BatchDownloadManager` 的 `max_attempts`、`retry_delay` 参数可调整尝试上限与重试等待基数，客户端不会主动降低音质。
 全部失败时显示原因，不提供空压缩包。
 重复 ID 会去重。ZIP 内音频仅以歌曲名和原扩展名命名，例如 `稻香.flac`；
 同名文件依次命名为 `稻香 (2).flac`、`稻香 (3).flac`，避免解压时覆盖。
@@ -292,9 +292,10 @@ GET /download/batch/<job_id>
 
 返回标准 `APIResponse`，`data` 包含 `state`（`queued` / `running` / `completed` / `failed`）、
 `total`、`completed`、`succeeded`、`failed`、`failures`、`message` 和 `filename`。
-`current_quality` 为当前尝试音质，`fallback_count` / `fallbacks` 为降级成功数量及明细。
+`current_quality` 为当前请求音质，`current_attempt` / `max_attempts` 为当前及最大尝试次数；
+`retry_count` 为已处理歌曲的额外尝试总数，`retried_count` / `retries` 为重试成功的歌曲数量及明细。
 清单中每首歌曲的 `requested_quality` 是请求音质，成功项的 `quality` 是最终音质，
-`attempts` 记录每次尝试的音质、成功状态及失败原因。仅所有音质都失败时增加 `failed`。
+`attempts` 记录每次尝试的编号、请求音质、成功状态及失败原因。仅达到重试上限仍失败时增加 `failed`。
 建议每 1.5 秒轮询一次，遇到 `completed` 或 `failed` 停止轮询。
 
 ```http
