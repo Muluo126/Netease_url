@@ -118,6 +118,18 @@ class BatchDownloadManager:
             return BASE_QUALITIES[BASE_QUALITIES.index(quality):]
         return (quality,) + BASE_QUALITIES
 
+    @staticmethod
+    def _archive_filename(title, extension, used_names):
+        stem = re.sub(r'[\x00-\x1f<>:"/\\|?*]', '_', title)[:180].strip(' .') or '未知歌曲'
+        if re.fullmatch(r'CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]', stem.split('.')[0], re.IGNORECASE):
+            stem = '_' + stem
+        filename = stem + extension
+        counter = 2
+        while filename.casefold() in used_names:
+            filename = f'{stem} ({counter}){extension}'
+            counter += 1
+        return filename
+
     def _download_with_fallback(self, job_id, song_id, song_dir, attempts):
         requested_quality = self.jobs[job_id]['quality']
         song_dir.mkdir()
@@ -140,7 +152,8 @@ class BatchDownloadManager:
                 continue
             actual_quality = result.music_info.quality if result.music_info else quality
             attempts.append({'quality': quality, 'success': True, 'actual_quality': actual_quality})
-            return file_path, actual_quality
+            title = getattr(result.music_info, 'name', None) or file_path.stem
+            return file_path, actual_quality, title
         raise RuntimeError(attempts[-1]['message'])
 
     def _run(self, job_id, ids):
@@ -150,6 +163,7 @@ class BatchDownloadManager:
         succeeded = 0
         failures = []
         fallbacks = []
+        used_names = set()
         try:
             self._update(job_id, state='running', message='正在下载')
             # 音频已压缩，ZIP_STORED 避免再次压缩耗费 CPU；始终使用磁盘文件。
@@ -159,10 +173,11 @@ class BatchDownloadManager:
                     attempts = []
                     self._update(job_id, current_id=song_id)
                     try:
-                        file_path, actual_quality = self._download_with_fallback(
+                        file_path, actual_quality, title = self._download_with_fallback(
                             job_id, song_id, song_dir, attempts)
-                        filename = f'{index:03d} - {song_id} - {file_path.name}'
+                        filename = self._archive_filename(title, file_path.suffix, used_names)
                         archive.write(file_path, arcname=filename)
+                        used_names.add(filename.casefold())
                         results.append({'id': song_id, 'success': True, 'filename': filename,
                                         'requested_quality': job['quality'], 'quality': actual_quality,
                                         'attempts': attempts})

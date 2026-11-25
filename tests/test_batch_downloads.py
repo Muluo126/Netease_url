@@ -58,7 +58,7 @@ class BatchDownloadTests(unittest.TestCase):
             manifest = json.loads(archive.read('下载清单.json'))
             self.assertEqual([song['id'] for song in manifest['songs']], [1, 2, 3, 4, 5])
             files = [entry for entry in manifest['songs'] if entry['success']]
-            self.assertEqual(len({entry['filename'] for entry in files}), 2)
+            self.assertEqual([entry['filename'] for entry in files], ['同名歌曲.flac', '同名歌曲 (2).flac'])
             self.assertEqual(archive.read(files[0]['filename']), b'audio:1:hires')
             self.assertEqual(archive.read(files[1]['filename']), b'audio:3:hires')
         self.assertEqual(list(path.parent.iterdir()), [path])
@@ -70,6 +70,43 @@ class BatchDownloadTests(unittest.TestCase):
         self.assertEqual(final['state'], 'failed')
         self.assertEqual(final['failed'], 3)
         self.assertIsNone(self.manager.get_archive(job['id']))
+
+    def test_zip_uses_metadata_title_and_preserves_extension_without_artist_or_id(self):
+        names = {1: '歌曲 - 副标题', 3: '歌曲 - 副标题', 6: '歌曲 - 副标题 (2)',
+                 7: '歌曲 - 副标题', 8: '歌曲 - 副标题'}
+
+        class NamedDownloader(FakeDownloader):
+            def download_music_file(self, song_id, quality):
+                result = super().download_music_file(song_id, quality)
+                if song_id == 8:
+                    renamed = Path(result.file_path).with_suffix('.mp3')
+                    Path(result.file_path).rename(renamed)
+                    result.file_path = str(renamed)
+                result.music_info = SimpleNamespace(name=names[song_id], quality=quality)
+                return result
+
+        manager = BatchDownloadManager(self.temp.name, downloader_factory=NamedDownloader)
+        job = manager.create([1, 3, 6, 7, 8], 'lossless')
+        self.assertEqual(wait_for_job(manager, job['id'])['succeeded'], 5)
+        path, _ = manager.get_archive(job['id'])
+        with zipfile.ZipFile(path) as archive:
+            expected = ['歌曲 - 副标题.flac', '歌曲 - 副标题 (2).flac',
+                        '歌曲 - 副标题 (2) (2).flac', '歌曲 - 副标题 (3).flac', '歌曲 - 副标题.mp3']
+            manifest = json.loads(archive.read('下载清单.json'))
+            self.assertEqual([song['filename'] for song in manifest['songs']], expected)
+            self.assertEqual(archive.namelist(), expected + ['下载清单.json'])
+            for song in manifest['songs']:
+                self.assertEqual(archive.read(song['filename']), f"audio:{song['id']}:lossless".encode())
+
+    def test_archive_names_are_safe_and_case_insensitive_duplicates_are_distinct(self):
+        used_names = set()
+        for title, expected in [('Track', 'Track.flac'), ('track', 'track (2).flac'),
+                                ('../曲名:/\\?*\x00', '_曲名______.flac'),
+                                ('CON', '_CON.flac'), (' . ', '未知歌曲.flac')]:
+            with self.subTest(title=title):
+                filename = self.manager._archive_filename(title, '.flac', used_names)
+                self.assertEqual(filename, expected)
+                used_names.add(filename.casefold())
 
     def test_rejects_invalid_input_before_downloading(self):
         for ids in (None, [], '1,2', [True], [1.2], [-1], [0], ['1e2'], ['../1'], [1] * 501, ['9' * 21]):
