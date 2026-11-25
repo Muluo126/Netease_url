@@ -274,6 +274,7 @@
     <script src="https://mirrors.sustech.edu.cn/cdnjs/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
     <script src="https://mirrors.sustech.edu.cn/cdnjs/ajax/libs/aplayer/1.10.1/APlayer.min.js"></script>
     <script src="https://mirrors.sustech.edu.cn/cdnjs/ajax/libs/twitter-bootstrap/5.1.3/js/bootstrap.bundle.min.js"></script>
+    <script src="{{ url_for('static', filename='batch-downloads.js') }}"></script>
     <script>
         $(document).ready(function() {
             function lrctrim(lyrics) {
@@ -432,27 +433,16 @@
                     dataType: 'json',
                     success: function(data) {
                         if (data.status === 200) {
-                            $('#search-list').empty();
-                            data.data.forEach(function(song) {
-                                const item = `<li class="list-group-item d-flex justify-content-between align-items-center">
-                                    <div>
-                                        <img src="${song.picUrl}" alt="cover" style="width:40px;height:40px;object-fit:cover;border-radius:4px;margin-right:10px;">
-                                        <strong class='song-title'>${song.name}</strong> - <span>${song.artists}</span> <span class="text-muted">[${song.album}]</span>
-                                    </div>
-                                    <div>
-                                        <button class="btn btn-sm btn-outline-primary select-song me-2" data-id="${song.id}" data-name="${song.name}">解析</button>
-                                        <button class="btn btn-sm btn-success download-song" data-id="${song.id}" data-name="${song.name}">下载</button>
-                                    </div>
-                                </li>`;
-                                $('#search-list').append(item);
-                            });
+                            window.batchDownloads.renderTracks('search', data.data);
                             $('#search-result').removeClass('d-none');
                         } else {
+                            window.batchDownloads.renderTracks('search', []);
                             $('#search-list').html('<li class="list-group-item">未找到相关歌曲</li>');
                             $('#search-result').removeClass('d-none');
                         }
                     },
                     error: function() {
+                        window.batchDownloads.renderTracks('search', []);
                         $('#search-list').html('<li class="list-group-item">搜索失败，请重试</li>');
                         $('#search-result').removeClass('d-none');
                     }
@@ -533,26 +523,18 @@
                         $('#playlist-creator').text('by ' + pl.creator);
                         $('#playlist-desc').text(pl.description || '');
                         $('#playlist-count').text(pl.trackCount);
-                        $('#playlist-tracks').empty();
-                        pl.tracks.forEach(function(song, idx) {
-                            const item = `<li class="list-group-item d-flex justify-content-between align-items-center">
-                                <div>
-                                    <img src="${song.picUrl}" alt="cover" style="width:32px;height:32px;object-fit:cover;border-radius:4px;margin-right:8px;">
-                                    <strong class="playlist-title">${idx+1}. ${song.name}</strong> - <span>${song.artists}</span> <span class="text-muted">[${song.album}]</span>
-                                </div>
-                                <div>
-                                    <button class="btn btn-sm btn-outline-primary select-song me-2" data-id="${song.id}" data-name="${song.name}">解析</button>
-                                    <button class="btn btn-sm btn-success download-song" data-id="${song.id}" data-name="${song.name}">下载</button>
-                                </div>
-                            </li>`;
-                            $('#playlist-tracks').append(item);
-                        });
+                        window.batchDownloads.renderTracks('playlist', pl.tracks);
                         $('#playlist-result').removeClass('d-none');
                     } else {
+                        window.batchDownloads.renderTracks('playlist', []);
                         $('#playlist-result').removeClass('d-none');
-                        $('#playlist-tracks').html('<li class="list-group-item">歌单解析失败：'+data.data.msg+'</li>');
+                        $('#playlist-tracks').append($('<li class="list-group-item">').text('歌单解析失败：' + data.message));
                     }
-                }, 'json');
+                }, 'json').fail(function() {
+                    window.batchDownloads.renderTracks('playlist', []);
+                    $('#playlist-result').removeClass('d-none');
+                    $('#playlist-tracks').text('歌单解析失败，请重试');
+                });
             });
 
             // 专辑解析
@@ -573,26 +555,18 @@
                         $('#album-artist').text(al.artist);
                         $('#album-desc').text(al.description || '');
                         $('#album-count').text(al.songs.length);
-                        $('#album-tracks').empty();
-                        al.songs.forEach(function(song, idx) {
-                            const item = `<li class="list-group-item d-flex justify-content-between align-items-center">
-                                <div>
-                                    <img src="${song.picUrl}" alt="cover" style="width:32px;height:32px;object-fit:cover;border-radius:4px;margin-right:8px;">
-                                    <strong class="playlist-title">${idx+1}. ${song.name}</strong> - <span>${song.artists}</span> <span class="text-muted">[${song.album}]</span>
-                                </div>
-                                <div>
-                                    <button class="btn btn-sm btn-outline-primary select-song me-2" data-id="${song.id}" data-name="${song.name}">解析</button>
-                                    <button class="btn btn-sm btn-success download-song" data-id="${song.id}" data-name="${song.name}">下载</button>
-                                </div>
-                            </li>`;
-                            $('#album-tracks').append(item);
-                        });
+                        window.batchDownloads.renderTracks('album', al.songs);
                         $('#album-result').removeClass('d-none');
                     } else {
+                        window.batchDownloads.renderTracks('album', []);
                         $('#album-result').removeClass('d-none');
-                        $('#album-tracks').html('<li class="list-group-item">专辑解析失败：'+data.data.msg+'</li>');
+                        $('#album-tracks').append($('<li class="list-group-item">').text('专辑解析失败：' + data.message));
                     }
-                }, 'json');
+                }, 'json').fail(function() {
+                    window.batchDownloads.renderTracks('album', []);
+                    $('#album-result').removeClass('d-none');
+                    $('#album-tracks').text('专辑解析失败，请重试');
+                });
             });
 
             // 音乐下载功能

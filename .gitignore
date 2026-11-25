@@ -9,3 +9,5 @@ __pycache__
 *.pyo
 *.pyd
 cookie.txt
+downloads/
+.qa/

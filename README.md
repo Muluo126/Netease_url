@@ -33,6 +33,7 @@
 ## ✨ 功能特性
 
 ### 🎵 核心功能
+- **📦 批量下载**：搜索、歌单和专辑结果支持勾选/全选，后台下载并打包 ZIP，附下载清单
 - **🔍 歌曲搜索**：支持关键词搜索网易云音乐库中的歌曲
 - **🎧 单曲解析**：解析单首歌曲的详细信息和下载链接
 - **📋 歌单解析**：批量解析歌单中的所有歌曲信息
@@ -140,6 +141,22 @@ docker run -d -p 5000:5000 netease-music-api
 2. 输入歌曲ID或链接
 3. 选择音质（标准/极高/无损/Hi-Res等）
 4. 点击**下载**按钮
+
+#### 📦 解析后批量下载
+
+1. 搜索歌曲，或解析歌单/专辑。
+2. 在结果列表中勾选歌曲（支持全选），选择批量下载音质，默认无损。
+3. 点击「下载选中」，或直接点击「下载全部」。每批最多 500 首。
+4. 页面显示后台处理进度，完成后自动请求保存 ZIP，也可点击「下载 ZIP」重新下载。
+
+ZIP 包含成功下载的音频和 `下载清单.json`，记录每首歌曲的成功结果或失败原因。
+单首失败会继续处理后续歌曲；全部失败时显示原因，不提供空压缩包。
+重复 ID 会去重；同名歌曲通过序号和 ID 区分，不会相互覆盖。
+
+任务完成后保留 1 小时，后续批量接口请求会清理过期任务及文件。请保持页面打开以查看进度；
+网络中断时可点击「继续查询进度」。服务重启后任务状态不会保留。
+后台任务存放在当前 Python 进程内，适用于项目默认的单进程、多线程部署；多 worker 部署需改用共享任务队列。
+同时最多运行 2 个批量任务，繁忙时返回 HTTP 429。下载继续使用服务端的 `cookie.txt` 和原有音质权限。
 
 ### 支持的链接格式
 
@@ -250,6 +267,38 @@ Content-Type: application/json
 }
 ```
 **响应**: 直接返回音频文件流
+
+#### 7. 批量下载
+
+```http
+POST /download/batch
+Content-Type: application/json
+
+{"ids": [185668, 123456], "quality": "lossless", "name": "我的歌单"}
+```
+
+`ids` 必填，为 1–500 个正整数 ID 的数组；`quality`、`name` 可选。
+创建成功返回 HTTP 202，任务 ID 为 `data.id`。
+
+```http
+GET /download/batch/<job_id>
+```
+
+返回标准 `APIResponse`，`data` 包含 `state`（`queued` / `running` / `completed` / `failed`）、
+`total`、`completed`、`succeeded`、`failed`、`failures`、`message` 和 `filename`。
+建议每 1.5 秒轮询一次，遇到 `completed` 或 `failed` 停止轮询。
+
+```http
+GET /download/batch/<job_id>/file
+```
+
+完成且至少一首成功时返回 ZIP 文件流；尚未完成或全部失败返回 HTTP 409；任务不存在或过期返回 HTTP 404。
+
+验证批量下载逻辑（使用模拟音频，不需要 Cookie）：
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ---
 

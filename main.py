@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 from urllib.parse import quote
 from flask import Flask, request, send_file, render_template, Response
+from batch_downloads import BatchDownloadManager, BatchBusyError
 
 try:
     from music_api import (
@@ -205,6 +206,7 @@ class MusicAPIService:
 config = APIConfig()
 app = Flask(__name__)
 api_service = MusicAPIService(config)
+batch_downloads = BatchDownloadManager(api_service.downloads_path / 'batches')
 
 
 @app.before_request
@@ -606,6 +608,43 @@ def download_music_api():
         return APIResponse.error(f"下载异常: {str(e)}", 500)
 
 
+@app.route('/download/batch', methods=['POST'])
+def create_batch_download():
+    """创建后台下载任务，避免大歌单占用 HTTP 请求直至超时。"""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return APIResponse.error('请提交 JSON 对象')
+    try:
+        job = batch_downloads.create(
+            data.get('ids'), data.get('quality', 'lossless'), data.get('name', '音乐批量下载'))
+        return APIResponse.success(job, '批量下载任务已创建', 202)
+    except ValueError as exc:
+        return APIResponse.error(str(exc))
+    except BatchBusyError as exc:
+        return APIResponse.error(str(exc), 429)
+
+
+@app.route('/download/batch/<job_id>', methods=['GET'])
+def get_batch_download(job_id):
+    job = batch_downloads.get(job_id)
+    if job is None:
+        return APIResponse.error('批量下载任务不存在或已过期', 404)
+    return APIResponse.success(job)
+
+
+@app.route('/download/batch/<job_id>/file', methods=['GET'])
+def get_batch_download_file(job_id):
+    job = batch_downloads.get(job_id)
+    if job is None:
+        return APIResponse.error('批量下载任务不存在或已过期', 404)
+    archive = batch_downloads.get_archive(job_id)
+    if archive is None:
+        return APIResponse.error('压缩包尚未生成或任务失败', 409)
+    path, filename = archive
+    return send_file(path.resolve(), as_attachment=True, download_name=filename,
+                     mimetype='application/zip', max_age=0)
+
+
 @app.route('/api/info', methods=['GET'])
 def api_info():
     """API信息接口"""
@@ -621,6 +660,9 @@ def api_info():
                 '/playlist': 'GET/POST - 获取歌单详情',
                 '/album': 'GET/POST - 获取专辑详情',
                 '/download': 'GET/POST - 下载音乐',
+                '/download/batch': 'POST - 创建批量下载任务（最多500首）',
+                '/download/batch/<job_id>': 'GET - 查询批量下载进度',
+                '/download/batch/<job_id>/file': 'GET - 下载ZIP压缩包',
                 '/api/info': 'GET - API信息'
             },
             'supported_qualities': [
